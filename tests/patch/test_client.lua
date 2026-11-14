@@ -14,43 +14,23 @@ local function is_false(value)
 end
 
 local client
-local process
-local handle
-local handlers
-local run_args
-local run_message
-local run_env
-local exec_calls
+local calls
 
 local function reset()
-  exec_calls = {}
-  handle = { closed = false, killed = 0 }
-  function handle:kill()
-    self.killed = self.killed + 1
-    self.closed = true
-  end
+  calls = {}
 
-  process = {
-    AGENT = "patch",
-    env = function(system_prompt)
-      return { PROMPT = system_prompt }
-    end,
-    run = function(args, message, env, supplied_handlers)
-      run_args = args
-      run_message = message
-      run_env = env
-      handlers = supplied_handlers
-      return handle
-    end,
-    exec = function(args, env, on_complete)
-      table.insert(exec_calls, { args = args, env = env, on_complete = on_complete })
-    end,
-    format_exit_error = function(result)
-      return "exit " .. result.code
+  package.loaded["patch.opencode.service"] = {
+    request = function(method, path, payload, on_complete)
+      local call = { method = method, path = path, payload = payload, on_complete = on_complete, cancelled = 0 }
+      call.handle = {
+        cancel = function()
+          call.cancelled = call.cancelled + 1
+        end,
+      }
+      table.insert(calls, call)
+      return call.handle
     end,
   }
-
-  package.loaded["patch.opencode.process"] = process
   package.loaded["patch.opencode.client"] = nil
   client = require("patch.opencode.client")
   client.setup()
@@ -58,7 +38,7 @@ end
 
 local function cleanup()
   package.loaded["patch.opencode.client"] = nil
-  package.loaded["patch.opencode.process"] = nil
+  package.loaded["patch.opencode.service"] = nil
 end
 
 local T = MiniTest.new_set({ hooks = { pre_case = reset, post_case = cleanup } })
@@ -80,194 +60,202 @@ local function record(result, values)
   end
 end
 
-local function text(message_id, value)
-  return {
-    type = "text",
-    sessionID = "ses_1",
-    part = { type = "text", messageID = message_id, text = value },
-  }
+local function last_call()
+  return calls[#calls]
 end
 
-local function step_finish(reason)
-  return { type = "step_finish", sessionID = "ses_1", part = { type = "step-finish", reason = reason } }
+--- Answer the pending service call after checking which endpoint it targets.
+local function reply(method, path, data, err)
+  local call = last_call()
+  eq(call.method .. " " .. call.path, method .. " " .. path)
+  call.on_complete(data, err)
+  return call
 end
 
-local function find_exec(args)
-  for _, call in ipairs(exec_calls) do
-    if vim.deep_equal(call.args, args) then
+local function idle(assistant)
+  return { data = { { type = "idle", outcome = "succeeded" }, assistant, { type = "user", text = "prompt" } } }
+end
+
+local function assistant(...)
+  local content = {}
+  for _, text in ipairs({ ... }) do
+    table.insert(content, { type = "text", text = text })
+  end
+  return { type = "assistant", finish = "stop", content = content }
+end
+
+--- Drive a request through session creation, instructions, and prompt submission.
+local function start_session(message, on_complete)
+  local request = client.request(message, on_complete)
+  reply("POST", "/api/session", { data = { id = "ses_1" } })
+  reply("PUT", "/api/experimental/session/ses_1/instructions/entries/patch.nvim", nil)
+  reply("POST", "/api/session/ses_1/prompt", { data = {} })
+  reply("POST", "/api/experimental/session/ses_1/wait", nil)
+  return request
+end
+
+local function find_call(method, path)
+  for _, call in ipairs(calls) do
+    if call.method == method and call.path == path then
       return call
     end
   end
 end
 
-test("sends the prompt on stdin and completes when opencode exits", function()
+test("runs the prompt in a restricted session and returns the final text", function()
   local result = {}
-  local request = client.request("replace this", function(value, err)
+  local request = start_session("replace this", function(value, err)
     record(result, { value = value, err = err })
   end)
 
-  eq(request.state, "pending")
-  eq(run_message, "replace this")
-  eq(run_args, {})
-  assert(run_env.PROMPT:find("inline code editor", 1, true))
+  local create = calls[1].payload
+  eq(create.title, "patch.nvim")
+  eq(create.agent, "build")
+  is_nil(create.model)
+  eq(create.permissions, client.PERMISSIONS)
+  assert(calls[2].payload.value:find("inline code editor", 1, true))
+  eq(calls[3].payload, { text = "replace this" })
 
-  handlers.on_record(text("msg_1", "replacement"))
-  handlers.on_record(step_finish("stop"))
-  vim.wait(20)
-  is_nil(result.called)
-
-  handlers.on_exit({ code = 0 })
-  wait_for_result(result)
-
-  eq(result.value, "replacement")
-  is_nil(result.err)
-  eq(request.state, "completed")
-end)
-
-test("deletes the opencode session after completing", function()
-  client.request("prompt", function() end)
-  handlers.on_record(text("msg_1", "x"))
-  handlers.on_exit({ code = 0 })
-
-  is_true(find_exec({ "session", "delete", "ses_1" }) ~= nil)
-end)
-
-test("uses the final message and joins its text parts", function()
-  local result = {}
-  client.request("prompt", function(value, err)
-    record(result, { value = value, err = err })
-  end)
-
-  handlers.on_record(text("msg_1", "narration before a tool call"))
-  handlers.on_record(step_finish("tool-calls"))
-  handlers.on_record(text("msg_2", "first"))
-  handlers.on_record(text("msg_2", "second"))
-  handlers.on_record(step_finish("stop"))
-  handlers.on_exit({ code = 0 })
+  reply("GET", "/api/session/ses_1/message?limit=20", idle(assistant("first", "second")))
   wait_for_result(result)
 
   eq(result.value, "first\nsecond")
   is_nil(result.err)
+  eq(request.state, "completed")
+  is_true(find_call("DELETE", "/api/session/ses_1") ~= nil)
 end)
 
-test("passes configured system prompt and model arguments", function()
-  client.setup({ system_prompt = "custom prompt", model = " openai/model " })
+test("passes configured system prompt and model reference", function()
+  client.setup({ system_prompt = "custom prompt", model = " openai/gpt-5#high " })
   client.request("prompt", function() end)
 
-  eq(run_args, { "--model", "openai/model" })
-  eq(run_env, { PROMPT = "custom prompt" })
+  eq(calls[1].payload.model, { providerID = "openai", id = "gpt-5", variant = "high" })
+  reply("POST", "/api/session", { data = { id = "ses_1" } })
+  eq(calls[2].payload, { value = "custom prompt" })
 end)
 
-test("treats a finished step without text as a deletion", function()
+test("never denies every read, which opencode's free models reject", function()
+  for _, rule in ipairs(client.PERMISSIONS) do
+    is_false(rule.action == "*" or (rule.action == "read" and rule.resource == "*"))
+  end
+end)
+
+test("rejects invalid model selectors without contacting opencode", function()
+  client.setup({ model = "not-a-selector" })
   local result = {}
   client.request("prompt", function(value, err)
     record(result, { value = value, err = err })
   end)
+  wait_for_result(result)
 
-  handlers.on_record(step_finish("stop"))
-  handlers.on_exit({ code = 0 })
+  eq(#calls, 0)
+  eq(result.err, "invalid model selector 'not-a-selector', expected provider/model")
+end)
+
+test("waits again while the session is still busy", function()
+  local result = {}
+  start_session("prompt", function(value, err)
+    record(result, { value = value, err = err })
+  end)
+
+  reply("GET", "/api/session/ses_1/message?limit=20", { data = { { type = "user", text = "prompt" } } })
+  reply("POST", "/api/experimental/session/ses_1/wait", nil)
+  reply("GET", "/api/session/ses_1/message?limit=20", idle(assistant("done")))
+  wait_for_result(result)
+
+  eq(result.value, "done")
+end)
+
+test("keeps empty text as a deletion", function()
+  local result = {}
+  start_session("prompt", function(value, err)
+    record(result, { value = value, err = err })
+  end)
+  reply("GET", "/api/session/ses_1/message?limit=20", idle(assistant()))
   wait_for_result(result)
 
   eq(result.value, "")
   is_nil(result.err)
 end)
 
-test("cancels a pending request once by killing opencode", function()
+test("cancels a pending request once and discards its session", function()
   local result = {}
-  local request = client.request("prompt", function(value, err)
+  local request = start_session("prompt", function(value, err)
     record(result, { value = value, err = err })
   end)
-  handlers.on_record({ type = "step_start", sessionID = "ses_1", part = {} })
+  local pending = last_call()
 
   is_true(client.cancel(request))
   is_false(client.cancel(request))
   wait_for_result(result)
 
   eq(request.state, "cancelled")
-  eq(handle.killed, 1)
+  eq(pending.cancelled, 1)
   is_nil(result.value)
   eq(result.err, "cancelled")
-  is_true(find_exec({ "session", "delete", "ses_1" }) ~= nil)
 
-  -- A late exit after cancellation is ignored.
-  handlers.on_exit({ code = 143 })
+  reply("POST", "/api/session/ses_1/interrupt", nil)
+  is_true(find_call("DELETE", "/api/session/ses_1") ~= nil)
+
+  -- A late response after cancellation is ignored.
+  pending.on_complete(idle(assistant("late")), nil)
   vim.wait(20)
   eq(result.err, "cancelled")
 end)
 
-test("reports error events from opencode", function()
-  local result = {}
+test("reports service, generation, and missing-response errors", function()
+  local failed = {}
   client.request("prompt", function(value, err)
-    record(result, { value = value, err = err })
+    record(failed, { value = value, err = err })
   end)
+  reply("POST", "/api/session", nil, "cannot connect")
+  wait_for_result(failed)
+  is_nil(failed.value)
+  eq(failed.err, "cannot connect")
 
-  handlers.on_record({
-    type = "error",
-    sessionID = "ses_1",
-    error = { name = "APIError", data = { message = "rate limited" } },
+  local provider = {}
+  start_session("prompt", function(value, err)
+    record(provider, { value = value, err = err })
+  end)
+  reply("GET", "/api/session/ses_1/message?limit=20", {
+    data = {
+      { type = "idle", outcome = "failed", error = { type = "provider.free-limit", message = "Free usage limit reached." } },
+      { type = "assistant", finish = "error", content = {}, error = { message = "Free usage limit reached." } },
+      { type = "user", text = "prompt" },
+    },
   })
-  handlers.on_exit({ code = 1 })
-  wait_for_result(result)
+  wait_for_result(provider)
+  eq(provider.err, "Free usage limit reached.")
 
-  is_nil(result.value)
-  eq(result.err, "rate limited")
+  local empty = {}
+  start_session("prompt", function(_, err)
+    record(empty, { err = err })
+  end)
+  reply("GET", "/api/session/ses_1/message?limit=20", { data = { { type = "idle" }, { type = "user", text = "prompt" } } })
+  wait_for_result(empty)
+  eq(empty.err, "opencode returned no response")
 end)
 
-test("reports missing responses", function()
-  local result = {}
-  client.request("prompt", function(_, err)
-    record(result, { err = err })
-  end)
-  handlers.on_exit({ code = 0 })
-  wait_for_result(result)
-  eq(result.err, "opencode returned no response")
-end)
-
-test("reports process start, stream, and exit failures", function()
-  process.run = function()
-    return nil, "cannot start"
-  end
-  local start_result = {}
-  client.request("prompt", function(_, err)
-    record(start_result, { err = err })
-  end)
-  wait_for_result(start_result)
-  eq(start_result.err, "cannot start")
-
-  process.run = function(_, _, _, supplied_handlers)
-    handlers = supplied_handlers
-    return handle
-  end
-  local exit_result = {}
-  client.request("prompt", function(_, err)
-    record(exit_result, { err = err })
-  end)
-  handlers.on_exit({ code = 7 })
-  wait_for_result(exit_result)
-  eq(exit_result.err, "exit 7")
-
-  local stream_result = {}
-  client.request("prompt", function(_, err)
-    record(stream_result, { err = err })
-  end)
-  handlers.on_error("bad json")
-  handlers.on_exit({ code = 143 })
-  wait_for_result(stream_result)
-  eq(stream_result.err, "bad json")
-end)
-
-test("parses available models from opencode models output", function()
+test("lists enabled models from the service", function()
   local result = {}
   client.get_available_models(function(models, err)
     record(result, { models = models, err = err })
   end)
 
-  local call = find_exec({ "models" })
-  call.on_complete("openai/gpt-5\nopencode/big-pickle\n\nnot a model line\n", nil)
+  eq(calls[1].method, "GET")
+  eq(calls[1].path, "/api/model")
+  calls[1].on_complete({
+    data = {
+      { providerID = "openai", id = "gpt-5", name = "GPT-5" },
+      { providerID = "opencode", id = "big-pickle" },
+      { providerID = "old", id = "off", enabled = false },
+      { name = "malformed" },
+    },
+  }, nil)
   wait_for_result(result)
 
   eq(result.models, {
-    { provider = "openai", id = "gpt-5", name = "gpt-5" },
+    { provider = "openai", id = "gpt-5", name = "GPT-5" },
     { provider = "opencode", id = "big-pickle", name = "big-pickle" },
   })
   is_nil(result.err)
@@ -276,13 +264,13 @@ test("parses available models from opencode models output", function()
   client.get_available_models(function(models, err)
     record(result, { models = models, err = err })
   end)
-  exec_calls[#exec_calls].on_complete(nil, "failed")
+  calls[2].on_complete(nil, "failed")
   wait_for_result(result)
   is_nil(result.models)
   eq(result.err, "failed")
 end)
 
-test("resolves configured, session, and cached default models", function()
+test("resolves configured, session, and service default models", function()
   local result = {}
   client.setup({ model = "configured/model" })
   client.resolve_model(function(value, err)
@@ -298,25 +286,18 @@ test("resolves configured, session, and cached default models", function()
   end)
   wait_for_result(result)
   eq(result.value, "provider/session")
+  eq(#calls, 0)
 
   client.setup()
   result = {}
   client.resolve_model(function(value, err)
     record(result, { value = value, err = err })
   end)
-  eq(#exec_calls, 1)
-  eq(exec_calls[1].args, { "debug", "config" })
-  exec_calls[1].on_complete(vim.json.encode({ model = "primary/model" }), nil)
+  eq(calls[1].path, "/api/model/default")
+  calls[1].on_complete({ data = { providerID = "primary", id = "model" } }, nil)
   wait_for_result(result)
   eq(result.value, "primary/model")
-
-  result = {}
-  client.resolve_model(function(value)
-    record(result, { value = value })
-  end)
-  wait_for_result(result)
-  eq(result.value, "primary/model")
-  eq(#exec_calls, 1)
+  is_nil(result.err)
 end)
 
 test("resolves no model when opencode has no default", function()
@@ -324,7 +305,7 @@ test("resolves no model when opencode has no default", function()
   client.resolve_model(function(value, err)
     record(result, { value = value, err = err })
   end)
-  exec_calls[1].on_complete('{"model":null}', nil)
+  calls[1].on_complete({ data = nil }, nil)
   wait_for_result(result)
   is_nil(result.value)
   is_nil(result.err)
@@ -333,9 +314,9 @@ test("resolves no model when opencode has no default", function()
   client.resolve_model(function(value, err)
     record(result, { value = value, err = err })
   end)
-  exec_calls[2].on_complete("not json", nil)
+  calls[2].on_complete(nil, "unreachable")
   wait_for_result(result)
-  eq(result.err, "opencode returned an invalid configuration")
+  eq(result.err, "unreachable")
 end)
 
 return T
