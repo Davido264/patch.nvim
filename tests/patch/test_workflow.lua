@@ -104,10 +104,10 @@ local function reset()
     },
   }
 
-  package.loaded["patch.pi.prompt"] = mocks.prompt
+  package.loaded["patch.core.prompt"] = mocks.prompt
   package.loaded["patch.core.selection"] = mocks.selection
   package.loaded["patch.core.context"] = mocks.context
-  package.loaded["patch.pi.client"] = mocks.client
+  package.loaded["patch.opencode.client"] = mocks.client
   package.loaded["patch.core.replacement"] = mocks.replacement
   package.loaded["patch.ui"] = mocks.ui
   package.loaded["patch.ui.notify"] = mocks.notify
@@ -118,8 +118,8 @@ end
 
 local function cleanup()
   for _, name in ipairs({
-    "patch.core.workflow", "patch.core.generation", "patch.pi.prompt",
-    "patch.core.selection", "patch.core.context", "patch.pi.client",
+    "patch.core.workflow", "patch.core.generation", "patch.core.prompt",
+    "patch.core.selection", "patch.core.context", "patch.opencode.client",
     "patch.core.replacement", "patch.ui", "patch.ui.notify",
   }) do
     package.loaded[name] = nil

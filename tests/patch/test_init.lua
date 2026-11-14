@@ -25,7 +25,7 @@ local function reset()
     cancel = function() calls.cancel = true end,
     open_menu = function() calls.open_menu = true end,
   }
-  package.loaded["patch.pi.client"] = client
+  package.loaded["patch.opencode.client"] = client
   package.loaded["patch.ui.notify"] = notify
   package.loaded["patch"] = nil
   patch = require("patch")
@@ -33,7 +33,7 @@ end
 
 local function cleanup()
   for _, name in ipairs({
-    "patch", "patch.core.workflow", "patch.pi.client", "patch.ui.notify",
+    "patch", "patch.core.workflow", "patch.opencode.client", "patch.ui.notify",
   }) do
     package.loaded[name] = nil
   end

@@ -5,7 +5,7 @@ local requests
 local function reset()
   requests = {}
 
-  package.loaded["patch.pi.client"] = {
+  package.loaded["patch.opencode.client"] = {
     request = function(message, on_complete)
       local request = { message = message, on_complete = on_complete }
       table.insert(requests, request)
@@ -16,7 +16,7 @@ local function reset()
       return true
     end,
   }
-  package.loaded["patch.pi.prompt"] = {
+  package.loaded["patch.core.prompt"] = {
     build = function(_, instruction)
       return "built:" .. instruction
     end,
@@ -27,7 +27,7 @@ end
 
 local function cleanup()
   for _, name in ipairs({
-    "patch.core.generation", "patch.pi.client", "patch.pi.prompt",
+    "patch.core.generation", "patch.opencode.client", "patch.core.prompt",
   }) do
     package.loaded[name] = nil
   end

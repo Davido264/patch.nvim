@@ -1,5 +1,5 @@
-local client = require("patch.pi.client")
-local prompt = require("patch.pi.prompt")
+local client = require("patch.opencode.client")
+local prompt = require("patch.core.prompt")
 
 local M = {}
 

@@ -1,13 +1,13 @@
 local workflow = require("patch.core.workflow")
-local client = require("patch.pi.client")
+local client = require("patch.opencode.client")
 local notify = require("patch.ui.notify")
 
 local M = {}
 
 ---@class PatchOptions
 ---@field notify? function|table notification provider compatible with vim.notify
----@field system_prompt? string custom Pi system prompt
----@field model? string Pi model selector in provider/model format
+---@field system_prompt? string custom opencode system prompt
+---@field model? string opencode model selector in provider/model format
 
 ---@param opts? PatchOptions
 function M.setup(opts)
@@ -44,7 +44,7 @@ function M.cancel()
   workflow.cancel()
 end
 
----Open the Pi model selection menu.
+---Open the opencode model selection menu.
 function M.open_menu()
   workflow.open_menu()
 end

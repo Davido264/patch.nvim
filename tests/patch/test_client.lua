@@ -14,44 +14,51 @@ local function is_false(value)
 end
 
 local client
-local rpc
-local connection
+local process
+local handle
 local handlers
-local start_args
-local sent
+local run_args
+local run_message
+local run_env
+local exec_calls
 
 local function reset()
-  sent = {}
-  connection = { closed = false }
-  function connection:send(record)
-    table.insert(sent, record)
-    return true
-  end
-  function connection:close()
+  exec_calls = {}
+  handle = { closed = false, killed = 0 }
+  function handle:kill()
+    self.killed = self.killed + 1
     self.closed = true
   end
 
-  rpc = {
-    start = function(args, supplied_handlers)
-      start_args = args
-      handlers = supplied_handlers
-      return connection
+  process = {
+    AGENT = "patch",
+    env = function(system_prompt)
+      return { PROMPT = system_prompt }
     end,
-    request = function() end,
+    run = function(args, message, env, supplied_handlers)
+      run_args = args
+      run_message = message
+      run_env = env
+      handlers = supplied_handlers
+      return handle
+    end,
+    exec = function(args, env, on_complete)
+      table.insert(exec_calls, { args = args, env = env, on_complete = on_complete })
+    end,
     format_exit_error = function(result)
       return "exit " .. result.code
     end,
   }
 
-  package.loaded["patch.pi.rpc"] = rpc
-  package.loaded["patch.pi.client"] = nil
-  client = require("patch.pi.client")
+  package.loaded["patch.opencode.process"] = process
+  package.loaded["patch.opencode.client"] = nil
+  client = require("patch.opencode.client")
   client.setup()
 end
 
 local function cleanup()
-  package.loaded["patch.pi.client"] = nil
-  package.loaded["patch.pi.rpc"] = nil
+  package.loaded["patch.opencode.client"] = nil
+  package.loaded["patch.opencode.process"] = nil
 end
 
 local T = MiniTest.new_set({ hooks = { pre_case = reset, post_case = cleanup } })
@@ -73,55 +80,70 @@ local function record(result, values)
   end
 end
 
-local function assistant_message(text, overrides)
-  return vim.tbl_extend("force", {
-    role = "assistant",
-    content = { { type = "text", text = text } },
-    stopReason = "stop",
-  }, overrides or {})
+local function text(message_id, value)
+  return {
+    type = "text",
+    sessionID = "ses_1",
+    part = { type = "text", messageID = message_id, text = value },
+  }
 end
 
-test("sends a prompt and completes only after the agent settles", function()
+local function step_finish(reason)
+  return { type = "step_finish", sessionID = "ses_1", part = { type = "step-finish", reason = reason } }
+end
+
+local function find_exec(args)
+  for _, call in ipairs(exec_calls) do
+    if vim.deep_equal(call.args, args) then
+      return call
+    end
+  end
+end
+
+test("sends the prompt on stdin and completes when opencode exits", function()
   local result = {}
   local request = client.request("replace this", function(value, err)
     record(result, { value = value, err = err })
   end)
 
   eq(request.state, "pending")
-  eq(sent[1], { type = "prompt", message = "replace this" })
-  eq(start_args, { "--system-prompt", start_args[2], "--no-session", "--thinking", "off" })
+  eq(run_message, "replace this")
+  eq(run_args, {})
+  assert(run_env.PROMPT:find("inline code editor", 1, true))
 
-  handlers.on_record({ type = "message_end", message = assistant_message("replacement") })
+  handlers.on_record(text("msg_1", "replacement"))
+  handlers.on_record(step_finish("stop"))
   vim.wait(20)
   is_nil(result.called)
 
-  handlers.on_record({ type = "agent_settled" })
+  handlers.on_exit({ code = 0 })
   wait_for_result(result)
 
   eq(result.value, "replacement")
   is_nil(result.err)
   eq(request.state, "completed")
-  is_true(connection.closed)
 end)
 
-test("uses the last assistant message and joins text parts", function()
+test("deletes the opencode session after completing", function()
+  client.request("prompt", function() end)
+  handlers.on_record(text("msg_1", "x"))
+  handlers.on_exit({ code = 0 })
+
+  is_true(find_exec({ "session", "delete", "ses_1" }) ~= nil)
+end)
+
+test("uses the final message and joins its text parts", function()
   local result = {}
   client.request("prompt", function(value, err)
     record(result, { value = value, err = err })
   end)
 
-  handlers.on_record({ type = "message_end", message = assistant_message("discarded") })
-  handlers.on_record({
-    type = "message_end",
-    message = assistant_message("ignored", {
-      content = {
-        { type = "text", text = "first" },
-        { type = "toolCall", name = "tool" },
-        { type = "text", text = "second" },
-      },
-    }),
-  })
-  handlers.on_record({ type = "agent_settled" })
+  handlers.on_record(text("msg_1", "narration before a tool call"))
+  handlers.on_record(step_finish("tool-calls"))
+  handlers.on_record(text("msg_2", "first"))
+  handlers.on_record(text("msg_2", "second"))
+  handlers.on_record(step_finish("stop"))
+  handlers.on_exit({ code = 0 })
   wait_for_result(result)
 
   eq(result.value, "first\nsecond")
@@ -132,85 +154,77 @@ test("passes configured system prompt and model arguments", function()
   client.setup({ system_prompt = "custom prompt", model = " openai/model " })
   client.request("prompt", function() end)
 
-  eq(start_args, {
-    "--system-prompt", "custom prompt", "--no-session", "--thinking", "off",
-    "--model", "openai/model",
-  })
+  eq(run_args, { "--model", "openai/model" })
+  eq(run_env, { PROMPT = "custom prompt" })
 end)
 
-test("treats empty assistant output as a deletion", function()
+test("treats a finished step without text as a deletion", function()
   local result = {}
   client.request("prompt", function(value, err)
     record(result, { value = value, err = err })
   end)
 
-  handlers.on_record({ type = "message_end", message = assistant_message("", { content = {} }) })
-  handlers.on_record({ type = "agent_settled" })
+  handlers.on_record(step_finish("stop"))
+  handlers.on_exit({ code = 0 })
   wait_for_result(result)
 
   eq(result.value, "")
   is_nil(result.err)
 end)
 
-test("cancels a pending request once", function()
+test("cancels a pending request once by killing opencode", function()
   local result = {}
   local request = client.request("prompt", function(value, err)
     record(result, { value = value, err = err })
   end)
+  handlers.on_record({ type = "step_start", sessionID = "ses_1", part = {} })
 
   is_true(client.cancel(request))
   is_false(client.cancel(request))
   wait_for_result(result)
 
   eq(request.state, "cancelled")
-  eq(sent[2], { type = "abort" })
+  eq(handle.killed, 1)
   is_nil(result.value)
   eq(result.err, "cancelled")
+  is_true(find_exec({ "session", "delete", "ses_1" }) ~= nil)
 
-  handlers.on_record({ type = "agent_settled" })
-  is_true(connection.closed)
+  -- A late exit after cancellation is ignored.
+  handlers.on_exit({ code = 143 })
+  vim.wait(20)
+  eq(result.err, "cancelled")
 end)
 
-test("reports prompt rejection", function()
+test("reports error events from opencode", function()
   local result = {}
   client.request("prompt", function(value, err)
     record(result, { value = value, err = err })
   end)
 
-  handlers.on_record({ type = "response", command = "prompt", success = false, error = "denied" })
+  handlers.on_record({
+    type = "error",
+    sessionID = "ses_1",
+    error = { name = "APIError", data = { message = "rate limited" } },
+  })
+  handlers.on_exit({ code = 1 })
   wait_for_result(result)
 
   is_nil(result.value)
-  eq(result.err, "Pi rejected the prompt: denied")
-  is_true(connection.closed)
+  eq(result.err, "rate limited")
 end)
 
-test("reports assistant and missing-response failures", function()
-  local error_result = {}
+test("reports missing responses", function()
+  local result = {}
   client.request("prompt", function(_, err)
-    record(error_result, { err = err })
+    record(result, { err = err })
   end)
-  handlers.on_record({
-    type = "message_end",
-    message = assistant_message("", { stopReason = "error", errorMessage = "model failed" }),
-  })
-  handlers.on_record({ type = "agent_settled" })
-  wait_for_result(error_result)
-  eq(error_result.err, "model failed")
-
-  client.setup()
-  connection.closed = false
-  local missing_result = {}
-  client.request("prompt", function(_, err)
-    record(missing_result, { err = err })
-  end)
-  handlers.on_record({ type = "agent_settled" })
-  wait_for_result(missing_result)
-  eq(missing_result.err, "Pi returned no response")
+  handlers.on_exit({ code = 0 })
+  wait_for_result(result)
+  eq(result.err, "opencode returned no response")
 end)
 
-test("reports process start and exit failures", function()
-  rpc.start = function()
+test("reports process start, stream, and exit failures", function()
+  process.run = function()
     return nil, "cannot start"
   end
   local start_result = {}
@@ -220,9 +234,9 @@ test("reports process start and exit failures", function()
   wait_for_result(start_result)
   eq(start_result.err, "cannot start")
 
-  rpc.start = function(args, supplied_handlers)
+  process.run = function(_, _, _, supplied_handlers)
     handlers = supplied_handlers
-    return connection
+    return handle
   end
   local exit_result = {}
   client.request("prompt", function(_, err)
@@ -231,35 +245,44 @@ test("reports process start and exit failures", function()
   handlers.on_exit({ code = 7 })
   wait_for_result(exit_result)
   eq(exit_result.err, "exit 7")
+
+  local stream_result = {}
+  client.request("prompt", function(_, err)
+    record(stream_result, { err = err })
+  end)
+  handlers.on_error("bad json")
+  handlers.on_exit({ code = 143 })
+  wait_for_result(stream_result)
+  eq(stream_result.err, "bad json")
 end)
 
-test("retrieves and validates available models", function()
-  local callback
-  rpc.request = function(command, on_complete)
-    eq(command, { type = "get_available_models" })
-    callback = on_complete
-  end
-
+test("parses available models from opencode models output", function()
   local result = {}
   client.get_available_models(function(models, err)
     record(result, { models = models, err = err })
   end)
-  local models = { { provider = "openai", id = "model", name = "Model" } }
-  callback({ data = { models = models } }, nil)
+
+  local call = find_exec({ "models" })
+  call.on_complete("openai/gpt-5\nopencode/big-pickle\n\nnot a model line\n", nil)
   wait_for_result(result)
-  eq(result.models, models)
+
+  eq(result.models, {
+    { provider = "openai", id = "gpt-5", name = "gpt-5" },
+    { provider = "opencode", id = "big-pickle", name = "big-pickle" },
+  })
+  is_nil(result.err)
 
   result = {}
-  client.get_available_models(function(value, err)
-    record(result, { value = value, err = err })
+  client.get_available_models(function(models, err)
+    record(result, { models = models, err = err })
   end)
-  callback({ data = {} }, nil)
+  exec_calls[#exec_calls].on_complete(nil, "failed")
   wait_for_result(result)
-  is_nil(result.value)
-  eq(result.err, "Pi returned an invalid model list")
+  is_nil(result.models)
+  eq(result.err, "failed")
 end)
 
-test("resolves configured, session, and cached primary models", function()
+test("resolves configured, session, and cached default models", function()
   local result = {}
   client.setup({ model = "configured/model" })
   client.resolve_model(function(value, err)
@@ -276,19 +299,14 @@ test("resolves configured, session, and cached primary models", function()
   wait_for_result(result)
   eq(result.value, "provider/session")
 
-  local requests = 0
-  local state_callback
-  rpc.request = function(command, on_complete)
-    requests = requests + 1
-    eq(command, { type = "get_state" })
-    state_callback = on_complete
-  end
   client.setup()
   result = {}
   client.resolve_model(function(value, err)
     record(result, { value = value, err = err })
   end)
-  state_callback({ data = { model = { provider = "primary", id = "model" } } }, nil)
+  eq(#exec_calls, 1)
+  eq(exec_calls[1].args, { "debug", "config" })
+  exec_calls[1].on_complete(vim.json.encode({ model = "primary/model" }), nil)
   wait_for_result(result)
   eq(result.value, "primary/model")
 
@@ -298,6 +316,26 @@ test("resolves configured, session, and cached primary models", function()
   end)
   wait_for_result(result)
   eq(result.value, "primary/model")
-  eq(requests, 1)
+  eq(#exec_calls, 1)
 end)
+
+test("resolves no model when opencode has no default", function()
+  local result = {}
+  client.resolve_model(function(value, err)
+    record(result, { value = value, err = err })
+  end)
+  exec_calls[1].on_complete('{"model":null}', nil)
+  wait_for_result(result)
+  is_nil(result.value)
+  is_nil(result.err)
+
+  result = {}
+  client.resolve_model(function(value, err)
+    record(result, { value = value, err = err })
+  end)
+  exec_calls[2].on_complete("not json", nil)
+  wait_for_result(result)
+  eq(result.err, "opencode returned an invalid configuration")
+end)
+
 return T

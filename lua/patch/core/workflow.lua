@@ -1,7 +1,7 @@
 local generation = require("patch.core.generation")
 local selection = require("patch.core.selection")
 local context = require("patch.core.context")
-local client = require("patch.pi.client")
+local client = require("patch.opencode.client")
 local replacement = require("patch.core.replacement")
 local ui = require("patch.ui")
 local notify = require("patch.ui.notify")
@@ -51,7 +51,7 @@ local function block_menu_for_active_input()
   return true
 end
 
---- Open a menu containing the models available to Pi.
+--- Open a menu containing the models available to opencode.
 function M.open_menu()
   if block_menu_for_active_input() then
     return
@@ -78,7 +78,7 @@ function M.open_menu()
       end
 
       if not models or #models == 0 then
-        warn("Pi reported no available models")
+        warn("opencode reported no available models")
         return
       end
 

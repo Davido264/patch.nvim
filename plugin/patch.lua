@@ -21,5 +21,5 @@ vim.api.nvim_create_user_command("PatchCancel", patch.cancel, {
 })
 
 vim.api.nvim_create_user_command("PatchMenu", patch.open_menu, {
-  desc = "List models available to Pi",
+  desc = "List models available to opencode",
 })
